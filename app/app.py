@@ -23,6 +23,7 @@ from mars_forecast_case.pipeline import build_outputs  # noqa: E402
 
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 HEADER_IMAGE = PROJECT_ROOT / "asset" / "Mars-Snacking.jpg"
+TARGET_WEEKS = ["W1", "W2", "W3", "W4"]
 MARS_RED = "#9E1B32"
 INK = "#263238"
 TEAL = "#007A78"
@@ -47,6 +48,10 @@ def load_dashboard_data() -> dict[str, object]:
         OUTPUT_DIR / "weekly_clean_data.csv",
         OUTPUT_DIR / "forecast_summary.csv",
         OUTPUT_DIR / "january_forecast_scenarios.csv",
+        OUTPUT_DIR / "promotion_combination_scenarios.csv",
+        OUTPUT_DIR / "promotion_combination_summary.csv",
+        OUTPUT_DIR / "weekly_error_analysis.csv",
+        OUTPUT_DIR / "forecast_error_summary.csv",
         OUTPUT_DIR / "period_summary.csv",
         OUTPUT_DIR / "promotion_summary.csv",
         OUTPUT_DIR / "key_metrics.json",
@@ -61,6 +66,12 @@ def load_dashboard_data() -> dict[str, object]:
         "weekly": pd.read_csv(OUTPUT_DIR / "weekly_clean_data.csv", parse_dates=["week_start"]),
         "forecast_summary": pd.read_csv(OUTPUT_DIR / "forecast_summary.csv"),
         "weekly_scenarios": pd.read_csv(OUTPUT_DIR / "january_forecast_scenarios.csv"),
+        "promotion_combinations": pd.read_csv(OUTPUT_DIR / "promotion_combination_scenarios.csv"),
+        "promotion_combination_summary": pd.read_csv(
+            OUTPUT_DIR / "promotion_combination_summary.csv"
+        ),
+        "weekly_errors": pd.read_csv(OUTPUT_DIR / "weekly_error_analysis.csv"),
+        "error_summary": pd.read_csv(OUTPUT_DIR / "forecast_error_summary.csv"),
         "period": pd.read_csv(OUTPUT_DIR / "period_summary.csv"),
         "promotion": pd.read_csv(OUTPUT_DIR / "promotion_summary.csv"),
         "metrics": metrics,
@@ -71,6 +82,18 @@ def fmt_k(value: float) -> str:
     """Format a thousands-of-cases value for KPI display."""
 
     return f"{value:,.0f}k"
+
+
+def fmt_pct(value: float) -> str:
+    """Format a percentage for KPI display."""
+
+    return f"{value:,.1f}%"
+
+
+def promo_week_key(weeks: list[str]) -> str:
+    """Return the scenario key used for promotion-week combinations."""
+
+    return "+".join(weeks) if weeks else "No promo"
 
 
 def apply_css() -> None:
@@ -177,6 +200,10 @@ data = load_dashboard_data()
 weekly = data["weekly"]
 forecast_summary = data["forecast_summary"]
 weekly_scenarios = data["weekly_scenarios"]
+promotion_combinations = data["promotion_combinations"]
+promotion_combination_summary = data["promotion_combination_summary"]
+weekly_errors = data["weekly_errors"]
+error_summary = data["error_summary"]
 period = data["period"]
 promotion = data["promotion"]
 metrics = data["metrics"]["metrics"]
@@ -204,6 +231,23 @@ def polish_plotly(fig: go.Figure, height: int) -> go.Figure:
 
 scenario_options = forecast_summary["scenario"].tolist()
 selected_scenario = st.sidebar.radio("Scenario", scenario_options, index=0)
+promo_assumptions = [
+    assumption
+    for assumption in promotion_combination_summary["promotion_assumption"].dropna().unique().tolist()
+    if assumption != "No promotion"
+]
+selected_promo_assumption = st.sidebar.selectbox(
+    "Promotion benchmark",
+    promo_assumptions,
+    index=promo_assumptions.index("Customer 1 median")
+    if "Customer 1 median" in promo_assumptions
+    else 0,
+)
+selected_promo_weeks = st.sidebar.multiselect(
+    "Promotion weeks",
+    TARGET_WEEKS,
+    default=["W2", "W3"],
+)
 show_ordered = st.sidebar.checkbox("Show estimated ordered demand", value=True)
 show_promotions = st.sidebar.checkbox("Highlight promotions", value=True)
 service_threshold = st.sidebar.slider("Casefill watchline", min_value=70, max_value=99, value=95, step=1)
@@ -223,6 +267,21 @@ promo_total = float(
         forecast_summary["scenario"].eq("Signed two-week promo"), "total_forecast_k_cases"
     ].iloc[0]
 )
+selected_promo_key = promo_week_key(selected_promo_weeks)
+if selected_promo_key == "No promo":
+    custom_summary_row = promotion_combination_summary[
+        promotion_combination_summary["scenario"].eq("No promotion - base")
+    ].iloc[0]
+else:
+    custom_summary_row = promotion_combination_summary[
+        promotion_combination_summary["promotion_assumption"].eq(selected_promo_assumption)
+        & promotion_combination_summary["promotion_weeks"].eq(selected_promo_key)
+    ].iloc[0]
+custom_scenario_name = custom_summary_row["scenario"]
+custom_weekly = promotion_combinations[
+    promotion_combinations["scenario"].eq(custom_scenario_name)
+].copy()
+custom_total = float(custom_summary_row["total_forecast_k_cases"])
 
 st.markdown(
     f"""
@@ -240,8 +299,8 @@ kpi_2.metric("Factory baseline", fmt_k(base_total), delta="P13 clean run-rate")
 kpi_3.metric("Signed promo gate", fmt_k(promo_total), delta="W2-W3 promotion")
 kpi_4.metric("Late-year service loss", fmt_k(metrics["service_loss_k_cases"]), delta=f"{metrics['service_affected_weeks']} low-service weeks")
 
-forecast_tab, drivers_tab, service_tab, signoff_tab = st.tabs(
-    ["Forecast", "Demand Drivers", "Service Risk", "Sign-Off"]
+forecast_tab, promo_tab, error_tab, drivers_tab, service_tab, signoff_tab = st.tabs(
+    ["Forecast", "Promo Simulator", "Error Analysis", "Demand Drivers", "Service Risk", "Sign-Off"]
 )
 
 with forecast_tab:
@@ -282,6 +341,191 @@ with forecast_tab:
     st.dataframe(
         scenario_weekly[
             ["target_period", "week_of_period", "forecast_k_cases", "assumption", "decision_use"]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+with promo_tab:
+    st.markdown(
+        """
+        <p class="section-note">
+        Build any promotion calendar by replacing selected base weeks with a historical
+        promotion-demand benchmark. This keeps the factory baseline separate from
+        conditional Sales upside.
+        </p>
+        """,
+        unsafe_allow_html=True,
+    )
+    sim_a, sim_b, sim_c, sim_d = st.columns(4)
+    sim_a.metric("Custom scenario total", fmt_k(custom_total), delta=f"{custom_total - base_total:,.0f}k vs base")
+    sim_b.metric("Promotion weeks", f"{int(custom_summary_row['promotion_week_count'])}", delta=selected_promo_key)
+    promo_value = custom_summary_row["promo_week_value_k_cases"]
+    sim_c.metric(
+        "Promo week benchmark",
+        "Base only" if pd.isna(promo_value) else fmt_k(float(promo_value)),
+        delta=selected_promo_assumption if selected_promo_key != "No promo" else "No promotion",
+    )
+    sim_d.metric("Factory baseline", fmt_k(base_total), delta="unchanged sign-off anchor")
+
+    left, right = st.columns([1.05, 1])
+    with left:
+        fig = px.bar(
+            custom_weekly,
+            x="week_of_period",
+            y="forecast_k_cases",
+            color="is_promo_week",
+            color_discrete_map={True: MARS_RED, False: TEAL},
+            labels={
+                "week_of_period": "Week of period",
+                "forecast_k_cases": "'000 cases",
+                "is_promo_week": "Promotion week",
+            },
+            title=f"{custom_scenario_name}: weekly forecast",
+        )
+        polish_plotly(fig, 385)
+        st.plotly_chart(fig, use_container_width=True)
+    with right:
+        assumption_matrix = promotion_combination_summary[
+            promotion_combination_summary["promotion_assumption"].isin(
+                ["No promotion", selected_promo_assumption]
+            )
+        ].copy()
+        assumption_matrix["display_combo"] = assumption_matrix["promotion_weeks"].replace(
+            {"No promo": "Base"}
+        )
+        assumption_matrix = assumption_matrix.sort_values(
+            ["promotion_week_count", "total_forecast_k_cases"]
+        )
+        fig = px.bar(
+            assumption_matrix,
+            x="total_forecast_k_cases",
+            y="display_combo",
+            orientation="h",
+            color="promotion_week_count",
+            color_continuous_scale=[TEAL, GOLD, MARS_RED],
+            labels={
+                "total_forecast_k_cases": "'000 cases",
+                "display_combo": "Promotion weeks",
+                "promotion_week_count": "Promo weeks",
+            },
+            title=f"All week combinations: {selected_promo_assumption}",
+        )
+        polish_plotly(fig, 385)
+        fig.update_layout(yaxis=dict(categoryorder="array", categoryarray=assumption_matrix["display_combo"].tolist()))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(
+        promotion_combination_summary[
+            promotion_combination_summary["promotion_assumption"].isin(
+                ["No promotion", selected_promo_assumption]
+            )
+        ][
+            [
+                "promotion_weeks",
+                "promotion_week_count",
+                "promotion_assumption",
+                "promo_week_value_k_cases",
+                "total_forecast_k_cases",
+                "incremental_vs_base_k_cases",
+            ]
+        ].sort_values(["promotion_week_count", "promotion_weeks"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+with error_tab:
+    overall_error = error_summary[error_summary["segment"].eq("Overall")].iloc[0]
+    promo_error = error_summary[error_summary["segment"].eq("Promotion weeks")].iloc[0]
+    nonpromo_error = error_summary[error_summary["segment"].eq("Non-promotion weeks")].iloc[0]
+    err_a, err_b, err_c, err_d = st.columns(4)
+    err_a.metric("Actual bias", fmt_pct(overall_error["bias_vs_actual_pct"]), delta="actual vs forecast")
+    err_b.metric("MAPE vs actual", fmt_pct(overall_error["mape_vs_actual_pct"]), delta="simple weekly average")
+    err_c.metric("WMAPE vs ordered", fmt_pct(overall_error["wmape_vs_ordered_pct"]), delta="casefill-adjusted")
+    err_d.metric(
+        "Promo vs non-promo MAPE",
+        fmt_pct(promo_error["mape_vs_actual_pct"]),
+        delta=f"{promo_error['mape_vs_actual_pct'] - nonpromo_error['mape_vs_actual_pct']:,.1f} pts",
+    )
+
+    left, right = st.columns([1.05, 1])
+    with left:
+        fig = px.bar(
+            error_summary,
+            x="mape_vs_actual_pct",
+            y="segment",
+            orientation="h",
+            color="bias_vs_actual_pct",
+            color_continuous_scale=[TEAL, "#F8FAFC", MARS_RED],
+            labels={
+                "mape_vs_actual_pct": "MAPE vs actual (%)",
+                "segment": "",
+                "bias_vs_actual_pct": "Bias (%)",
+            },
+            title="Forecast error by segment",
+        )
+        polish_plotly(fig, 410)
+        st.plotly_chart(fig, use_container_width=True)
+    with right:
+        fig = px.scatter(
+            weekly_errors,
+            x="week",
+            y="ordered_error_k_cases",
+            color="promo_segment",
+            symbol="service_flag",
+            hover_data=["period", "week_of_period", "forecast_k_cases", "estimated_ordered_k_cases"],
+            color_discrete_map={"Promotion": MARS_RED, "No promotion": TEAL},
+            labels={
+                "week": "Week",
+                "ordered_error_k_cases": "Ordered demand - forecast ('000)",
+                "promo_segment": "Segment",
+                "service_flag": "Service",
+            },
+            title="Weekly error against casefill-adjusted demand",
+        )
+        fig.add_hline(y=0, line_color=GRAY, line_dash="dash")
+        polish_plotly(fig, 410)
+        st.plotly_chart(fig, use_container_width=True)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=period["period"],
+            y=period["actual_vs_forecast_pct"],
+            name="Actual vs forecast",
+            marker_color=MARS_RED,
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=period["period"],
+            y=period["ordered_vs_forecast_pct"],
+            name="Ordered vs forecast",
+            marker_color=TEAL,
+        )
+    )
+    fig.add_hline(y=0, line_color=GRAY, line_dash="dash")
+    polish_plotly(fig, 340)
+    fig.update_layout(
+        title="Period-level bias: delivered actuals vs casefill-adjusted ordered demand",
+        xaxis_title="Period",
+        yaxis_title="Bias (%)",
+        barmode="group",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(
+        error_summary[
+            [
+                "segment",
+                "weeks",
+                "forecast_k_cases",
+                "actual_k_cases",
+                "estimated_ordered_k_cases",
+                "bias_vs_actual_pct",
+                "mape_vs_actual_pct",
+                "wmape_vs_ordered_pct",
+            ]
         ],
         use_container_width=True,
         hide_index=True,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
@@ -42,6 +43,17 @@ def summarize_history(df: pd.DataFrame) -> dict[str, float]:
             (df["actual_k_cases"].sum() / df["forecast_k_cases"].sum() - 1) * 100
         ),
         "source_year_mape_pct": float(df["absolute_percentage_error"].mean() * 100),
+        "source_year_wmape_pct": float(
+            df["forecast_error_k_cases"].abs().sum() / df["actual_k_cases"].sum() * 100
+        ),
+        "source_year_ordered_bias_pct": float(
+            (df["estimated_ordered_k_cases"].sum() / df["forecast_k_cases"].sum() - 1) * 100
+        ),
+        "source_year_ordered_wmape_pct": float(
+            (df["estimated_ordered_k_cases"] - df["forecast_k_cases"]).abs().sum()
+            / df["estimated_ordered_k_cases"].sum()
+            * 100
+        ),
         "promo_week_count": int(promo.shape[0]),
         "non_promo_week_count": int(no_promo.shape[0]),
         "customer_1_promo_median_ordered_k_cases": float(
@@ -125,6 +137,216 @@ def upside_promo_week_demand(df: pd.DataFrame) -> float:
 
     promo = df.loc[df["promo_flag"], "estimated_ordered_k_cases"]
     return float(promo.quantile(0.75))
+
+
+def promotion_demand_references(df: pd.DataFrame) -> pd.DataFrame:
+    """Return promotion demand benchmarks that can be used in scenario simulation."""
+
+    promo = df.loc[df["promo_flag"], "estimated_ordered_k_cases"]
+    references = [
+        {
+            "promotion_assumption": "Customer 1 median",
+            "promo_week_value_k_cases": promotion_week_demand(df, "Customer 1"),
+            "definition": "Median estimated ordered demand across Customer 1 promotion weeks.",
+        },
+        {
+            "promotion_assumption": "Customer 2 median",
+            "promo_week_value_k_cases": promotion_week_demand(df, "Customer 2"),
+            "definition": "Median estimated ordered demand across Customer 2 promotion weeks.",
+        },
+        {
+            "promotion_assumption": "All promo median",
+            "promo_week_value_k_cases": float(promo.median()),
+            "definition": "Median estimated ordered demand across all observed promotion weeks.",
+        },
+        {
+            "promotion_assumption": "All promo Q75",
+            "promo_week_value_k_cases": upside_promo_week_demand(df),
+            "definition": "75th percentile estimated ordered demand across all observed promotion weeks.",
+        },
+    ]
+    return pd.DataFrame(references)
+
+
+def week_combinations(weeks: list[str] | None = None) -> list[tuple[str, ...]]:
+    """Return every possible promotion-week combination, including no promotion."""
+
+    source_weeks = weeks or TARGET_WEEKS
+    return [
+        combo
+        for size in range(len(source_weeks) + 1)
+        for combo in combinations(source_weeks, size)
+    ]
+
+
+def promotion_week_label(promo_weeks: tuple[str, ...]) -> str:
+    """Format a tuple of promotion weeks for display and joins."""
+
+    return "+".join(promo_weeks) if promo_weeks else "No promo"
+
+
+def build_promotion_combination_scenarios(df: pd.DataFrame) -> pd.DataFrame:
+    """Build weekly forecasts for every promotion-week combination.
+
+    The base forecast remains the clean P13 weekly demand. For each non-empty
+    combination of W1-W4, selected weeks are replaced by a promotion benchmark
+    such as Customer 1 median or all-promo Q75 demand.
+    """
+
+    base = base_weekly_forecast(df)
+    references = promotion_demand_references(df)
+    rows: list[dict[str, object]] = []
+
+    for promo_weeks in week_combinations(TARGET_WEEKS):
+        if promo_weeks:
+            reference_rows = references.to_dict("records")
+        else:
+            reference_rows = [
+                {
+                    "promotion_assumption": "No promotion",
+                    "promo_week_value_k_cases": np.nan,
+                    "definition": "Clean P13 base forecast with no promotion weeks replaced.",
+                }
+            ]
+
+        promo_weeks_set = set(promo_weeks)
+        promo_weeks_label = promotion_week_label(promo_weeks)
+        for reference in reference_rows:
+            promo_value = reference["promo_week_value_k_cases"]
+            scenario_name = (
+                "No promotion - base"
+                if not promo_weeks
+                else f"{reference['promotion_assumption']}: {promo_weeks_label}"
+            )
+            for week_of_period, base_value in base.items():
+                is_promo_week = week_of_period in promo_weeks_set
+                forecast_value = float(promo_value if is_promo_week else base_value)
+                rows.append(
+                    {
+                        "target_year": TARGET_YEAR,
+                        "target_period": TARGET_PERIOD,
+                        "scenario": scenario_name,
+                        "promotion_assumption": reference["promotion_assumption"],
+                        "promotion_weeks": promo_weeks_label,
+                        "promotion_week_count": len(promo_weeks),
+                        "week_of_period": week_of_period,
+                        "is_promo_week": is_promo_week,
+                        "base_forecast_k_cases": float(base_value),
+                        "promo_week_value_k_cases": float(promo_value)
+                        if pd.notna(promo_value)
+                        else np.nan,
+                        "forecast_k_cases": forecast_value,
+                        "assumption_definition": reference["definition"],
+                    }
+                )
+
+    return pd.DataFrame(rows)
+
+
+def promotion_combination_summary(combination_weekly: pd.DataFrame) -> pd.DataFrame:
+    """Summarize total volume for every generated promotion-week combination."""
+
+    base_total = float(
+        combination_weekly.loc[
+            combination_weekly["scenario"].eq("No promotion - base"),
+            "forecast_k_cases",
+        ].sum()
+    )
+    summary = (
+        combination_weekly.groupby(
+            [
+                "scenario",
+                "promotion_assumption",
+                "promotion_weeks",
+                "promotion_week_count",
+                "promo_week_value_k_cases",
+                "assumption_definition",
+            ],
+            dropna=False,
+            as_index=False,
+        )
+        .agg(
+            total_forecast_k_cases=("forecast_k_cases", "sum"),
+            min_weekly_forecast_k_cases=("forecast_k_cases", "min"),
+            max_weekly_forecast_k_cases=("forecast_k_cases", "max"),
+        )
+        .sort_values(["promotion_week_count", "promotion_assumption", "promotion_weeks"])
+    )
+    summary["incremental_vs_base_k_cases"] = summary["total_forecast_k_cases"] - base_total
+    summary.loc[
+        summary["incremental_vs_base_k_cases"].abs() < 1e-9, "incremental_vs_base_k_cases"
+    ] = 0.0
+    return summary
+
+
+def weekly_error_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    """Return week-level forecast error fields for dashboard diagnostics."""
+
+    errors = df.copy()
+    errors["ordered_error_k_cases"] = (
+        errors["estimated_ordered_k_cases"] - errors["forecast_k_cases"]
+    )
+    errors["absolute_ordered_error_k_cases"] = errors["ordered_error_k_cases"].abs()
+    errors["ordered_absolute_percentage_error"] = (
+        errors["absolute_ordered_error_k_cases"]
+        / errors["estimated_ordered_k_cases"].replace(0, np.nan)
+    )
+    errors["service_flag"] = np.where(errors["casefill"] < 0.95, "Casefill <95%", "Normal service")
+    errors["promo_segment"] = np.where(errors["promo_flag"], "Promotion", "No promotion")
+    errors["forecast_position"] = np.where(
+        errors["forecast_error_k_cases"] < 0,
+        "Forecast above actual",
+        "Forecast below actual",
+    )
+    return errors
+
+
+def forecast_error_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize forecast error by business-relevant segments."""
+
+    errors = weekly_error_analysis(df)
+    segment_masks = {
+        "Overall": pd.Series(True, index=errors.index),
+        "Promotion weeks": errors["promo_flag"],
+        "Non-promotion weeks": ~errors["promo_flag"],
+        "Service constrained weeks": errors["casefill"] < 0.95,
+        "Normal service weeks": errors["casefill"] >= 0.95,
+        "Recent clean base weeks": (errors["period_number"] >= 10)
+        & (~errors["promo_flag"])
+        & (errors["casefill"] >= 0.95),
+    }
+    rows: list[dict[str, float | str]] = []
+    for segment, mask in segment_masks.items():
+        subset = errors.loc[mask].copy()
+        if subset.empty:
+            continue
+        actual_total = subset["actual_k_cases"].sum()
+        ordered_total = subset["estimated_ordered_k_cases"].sum()
+        forecast_total = subset["forecast_k_cases"].sum()
+        rows.append(
+            {
+                "segment": segment,
+                "weeks": int(subset.shape[0]),
+                "forecast_k_cases": float(forecast_total),
+                "actual_k_cases": float(actual_total),
+                "estimated_ordered_k_cases": float(ordered_total),
+                "bias_vs_actual_pct": float((actual_total / forecast_total - 1) * 100),
+                "bias_vs_ordered_pct": float((ordered_total / forecast_total - 1) * 100),
+                "mae_vs_actual_k_cases": float(subset["forecast_error_k_cases"].abs().mean()),
+                "mape_vs_actual_pct": float(subset["absolute_percentage_error"].mean() * 100),
+                "wmape_vs_actual_pct": float(
+                    subset["forecast_error_k_cases"].abs().sum() / actual_total * 100
+                ),
+                "mae_vs_ordered_k_cases": float(subset["absolute_ordered_error_k_cases"].mean()),
+                "mape_vs_ordered_pct": float(
+                    subset["ordered_absolute_percentage_error"].mean() * 100
+                ),
+                "wmape_vs_ordered_pct": float(
+                    subset["absolute_ordered_error_k_cases"].sum() / ordered_total * 100
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def build_january_scenarios(df: pd.DataFrame) -> list[ForecastScenario]:
