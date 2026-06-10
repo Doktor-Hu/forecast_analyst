@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from docx import Document
+
 
 from mars_forecast_case.config import BRIEF_PATH, EXCEL_PATH
 
@@ -21,12 +21,6 @@ class CaseMetadata:
     source_file: Path
 
 
-def read_case_brief(path: Path = BRIEF_PATH) -> str:
-    """Return the non-empty paragraphs from the Word assignment brief."""
-
-    document = Document(path)
-    paragraphs = [paragraph.text.strip() for paragraph in document.paragraphs]
-    return "\n".join(text for text in paragraphs if text)
 
 
 def load_supporting_data(path: Path = EXCEL_PATH) -> tuple[pd.DataFrame, CaseMetadata]:
